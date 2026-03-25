@@ -1,0 +1,405 @@
+import argparse
+import time
+import tempfile
+import urllib.request
+import os
+import sys
+from typing import Optional
+
+import cv2
+
+_SELECTED_THAI_FONT_PATH: Optional[str] = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+
+def _draw_unicode_text(img, text, position, font_size=32, color=(0, 255, 0)):
+    """Draw Unicode text (e.g., Thai) onto an OpenCV image.
+
+    Falls back to cv2.putText when Pillow is not available.
+    """
+
+    if not _PIL_AVAILABLE:
+        cv2.putText(img, text, position, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        return
+
+    from numpy import array
+
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    def _find_thai_font_path():
+        """Find a font file that supports Thai text (prefers Sarabun)."""
+       
+        filename_candidates = [
+            "Sarabun-Regular.ttf",
+            "TH Sarabun New.ttf",
+            "THSarabun.ttf",
+            "THSarabunNew.ttf",
+            "THSarabun Bold.ttf",
+            "THSarabunNew Bold.ttf",
+            "Leelawadee UI.ttf",
+            "NotoSansThai-Regular.ttf",
+            "Tahoma.ttf",
+        ]
+
+       
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_font_dirs = [script_dir, os.getcwd(), os.path.join(script_dir, "ฟอนต์")]
+
+        for base in local_font_dirs:
+           
+            for name in filename_candidates:
+                path = os.path.join(base, name)
+                if os.path.exists(path):
+                    return path
+
+            if os.path.isdir(base):
+                for root, _, files in os.walk(base):
+                    for file in files:
+                        if file.lower().endswith(".ttf") and "sarabun" in file.lower():
+                            return os.path.join(root, file)
+
+        system_font_dirs = []
+        if os.name == "nt":
+            system_font_dirs.append(os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts"))
+        else:
+            system_font_dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts", "/Library/Fonts"])
+
+        for base in system_font_dirs:
+            for name in filename_candidates:
+                path = os.path.join(base, name)
+                if os.path.exists(path):
+                    return path
+            if os.path.isdir(base):
+                for root, _, files in os.walk(base):
+                    for file in files:
+                        if file.lower().endswith(".ttf") and "sarabun" in file.lower():
+                            return os.path.join(root, file)
+
+        for name in ["Leelawadee UI.ttf", "Tahoma.ttf", "NotoSansThai-Regular.ttf"]:
+            try:
+                ImageFont.truetype(name, font_size)
+                return name
+            except Exception:
+                pass
+
+        return None
+
+    global _SELECTED_THAI_FONT_PATH
+    if _SELECTED_THAI_FONT_PATH is None:
+        _SELECTED_THAI_FONT_PATH = _find_thai_font_path()
+        if _SELECTED_THAI_FONT_PATH:
+            try:
+                print(f"[font] ใช้ฟอนต์ไทย: {_SELECTED_THAI_FONT_PATH}")
+            except Exception:
+                pass
+
+    if _SELECTED_THAI_FONT_PATH:
+        try:
+            font = ImageFont.truetype(_SELECTED_THAI_FONT_PATH, font_size)
+        except Exception:
+            font = ImageFont.load_default()
+    else:
+        font = ImageFont.load_default()
+
+    rgb_color = (color[2], color[1], color[0])
+    draw.text(position, text, font=font, fill=rgb_color)
+
+    img[:] = cv2.cvtColor(array(img_pil), cv2.COLOR_RGB2BGR)
+
+
+def classify_gesture(hand_landmarks):
+    fingers_extended = []
+    tip_ids = [8, 12, 16, 20] 
+    for tip_id in tip_ids:
+        pip_id = tip_id - 2
+        if hand_landmarks[tip_id].y < hand_landmarks[pip_id].y:
+            fingers_extended.append(True)
+        else:
+            fingers_extended.append(False)
+    if all(fingers_extended):
+        return "ศิลปะกรรรรรรรรร"
+    if fingers_extended[0] and not any(fingers_extended[1:]):
+        return "ฉัน"
+    if hand_landmarks[4].y < hand_landmarks[3].y and not any(fingers_extended):
+        return "ดี"
+    return "ไม่มีคำนี้นะ"
+
+
+DEFAULT_TASK_MODEL_URL = 'https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task'
+
+
+def download_model(url: str) -> str:
+    fd, path = tempfile.mkstemp(suffix='.task')
+    os.close(fd)
+    try:
+        urllib.request.urlretrieve(url, path)
+        return path
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
+
+def open_capture(camera_index: int = 0, video_path: Optional[str] = None):
+    """Open a video capture from a webcam or a video file.
+
+    On Windows, using CAP_DSHOW often improves camera access.
+    """
+
+    if video_path:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Cannot open video file: {video_path}")
+        return cap
+
+    for idx in range(camera_index, camera_index + 3):
+        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            print(f"Using camera index {idx}")
+            return cap
+        cap.release()
+    print(f"Cannot open any camera (tried indexes {camera_index}-{camera_index+2})")
+    return cv2.VideoCapture(camera_index)
+
+
+def run_with_solutions(cap, max_num_hands: int, min_detection_confidence: float):
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+
+    with mp_hands.Hands(
+        max_num_hands=max_num_hands,
+        min_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=0.5,
+    ) as hands:
+        prev_time = 0
+        recognized_words = []
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame from camera. Exiting.")
+                break
+
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image.flags.writeable = False
+            results = hands.process(image)
+
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+            current_word = None
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    mp_drawing.draw_landmarks(
+                        image,
+                        hand_landmarks,
+                        mp_hands.HAND_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2),
+                    )
+                    current_word = classify_gesture(hand_landmarks.landmark)
+
+            if current_word:
+                if not recognized_words or recognized_words[-1] != current_word:
+                    recognized_words.append(current_word)
+
+            if current_word:
+                _draw_unicode_text(image, current_word, (10, 60), font_size=30, color=(0, 255, 0))
+
+            #FPS
+            curr_time = time.time()
+            fps = 1 / (curr_time - prev_time) if prev_time else 0.0
+            prev_time = curr_time
+            cv2.putText(image, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+            cv2.imshow('Hand Detection (press q to quit)', image)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            if key == ord('p'):
+                print('Recognized words:', recognized_words)
+
+
+def run_with_tasks(cap, model_path: str, max_num_hands: int, min_detection_confidence: float):
+    import mediapipe as mp
+    # import task modules
+    from mediapipe.tasks.python.vision import hand_landmarker as hl_module
+    from mediapipe.tasks.python.core.base_options import BaseOptions
+    from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+    from mediapipe.tasks.python.vision.core import vision_task_running_mode as vrm
+
+    base_options = BaseOptions(model_asset_path=model_path)
+    running_mode = getattr(vrm.VisionTaskRunningMode, 'VIDEO', vrm.VisionTaskRunningMode.IMAGE)
+    options = HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=running_mode,
+        num_hands=max_num_hands,
+        min_hand_detection_confidence=min_detection_confidence,
+        min_tracking_confidence=0.5,
+    )
+
+    landmarker = HandLandmarker.create_from_options(options)
+
+    prev_time = 0
+    recognized_words = []
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to read frame from camera. Exiting.")
+                break
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            mp_image = mp.Image(mp.ImageFormat.SRGB, rgb)
+            timestamp_ms = int(time.time() * 1000)
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+            image_out = frame.copy()
+            h, w, _ = image_out.shape
+
+            current_word = None
+            if result and getattr(result, 'hand_landmarks', None):
+                for hand_landmarks in result.hand_landmarks:
+                    pts = []
+                    for lm in hand_landmarks:
+                        x = int(lm.x * w)
+                        y = int(lm.y * h)
+                        pts.append((x, y))
+                        cv2.circle(image_out, (x, y), 3, (0, 255, 0), -1)
+
+                    current_word = classify_gesture(hand_landmarks)
+
+                    try:
+                        connections = hl_module.HandLandmarksConnections.HAND_CONNECTIONS
+                        for conn in connections:
+                            start = (int(hand_landmarks[conn.start].x * w), int(hand_landmarks[conn.start].y * h))
+                            end = (int(hand_landmarks[conn.end].x * w), int(hand_landmarks[conn.end].y * h))
+                            cv2.line(image_out, start, end, (0, 255, 255), 2)
+                    except Exception:
+                        pass
+
+            if current_word:
+                if not recognized_words or recognized_words[-1] != current_word:
+                    recognized_words.append(current_word)
+
+            if current_word:
+                _draw_unicode_text(image_out, current_word, (10, 60), font_size=30, color=(0, 255, 0))
+
+            curr_time = time.time()
+            fps = 1 / (curr_time - prev_time) if prev_time else 0.0
+            prev_time = curr_time
+            cv2.putText(image_out, f"FPS: {int(fps)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+            cv2.imshow('Hand Detection (press q to quit)', image_out)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q') or key == 27:
+                break
+            if key == ord('p'):
+                print('Recognized words:', recognized_words)
+    finally:
+        landmarker.close()
+
+
+def main(camera_index: int = 0, video_path: Optional[str] = None, max_num_hands: int = 2, min_detection_confidence: float = 0.5, model: Optional[str] = None):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+    if not _PIL_AVAILABLE:
+        print('คำเตือน: Pillow ยังไม่ติดตั้ง; ข้อความไทยอาจแสดงเป็น ???? (ติดตั้งด้วย pip install pillow)')
+
+    cap = open_capture(camera_index, video_path=video_path)
+    if not cap.isOpened():
+        print("Failed to open camera or video source. Make sure a webcam is connected or provide a valid --video file.")
+        return
+
+    try:
+        import mediapipe as mp
+        if hasattr(mp, 'solutions'):
+            run_with_solutions(cap, max_num_hands, min_detection_confidence)
+            cap.release()
+            cv2.destroyAllWindows()
+            return
+    except Exception:
+        pass
+
+    try:
+        import mediapipe as mp
+        model_path = model
+        if not model_path:
+            print('No task model provided; downloading default model...')
+            model_path = download_model(DEFAULT_TASK_MODEL_URL)
+            print('Downloaded model to', model_path)
+
+        run_with_tasks(cap, model_path, max_num_hands, min_detection_confidence)
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def test_mode(max_num_hands: int = 2, min_detection_confidence: float = 0.5, model: Optional[str] = None):
+    """Run a headless check to detect which MediaPipe API is available and exercise it without camera."""
+    import numpy as np
+    print('Running headless test...')
+    try:
+        import mediapipe as mp
+        print('mediapipe module:', getattr(mp, '__file__', 'builtin'))
+        if hasattr(mp, 'solutions'):
+            print('Using mp.solutions (Hands)')
+            try:
+                mp_hands = mp.solutions.hands
+                with mp_hands.Hands(
+                    max_num_hands=max_num_hands,
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=0.5,
+                ) as hands:
+                    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+                    img = cv2.cvtColor(dummy, cv2.COLOR_BGR2RGB)
+                    img.flags.writeable = False
+                    res = hands.process(img)
+                    print('mp.solutions.Hands.process() returned:', bool(res and getattr(res, 'multi_hand_landmarks', None)))
+            except Exception as e:
+                print('Error exercising mp.solutions.Hands:', e)
+        elif hasattr(mp, 'tasks'):
+            print('mp.solutions not present; mediapipe.tasks detected')
+            try:
+                from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+                print('HandLandmarker class available; creating instance requires a .task model file (not attempted in --test)')
+            except Exception as e:
+                print('Error inspecting mediapipe.tasks APIs:', e)
+        else:
+            print('mediapipe installed but no recognizable API found (neither solutions nor tasks)')
+    except Exception as e:
+        print('mediapipe import failed:', e)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Hand detection with MediaPipe (solutions or tasks) and OpenCV')
+    parser.add_argument('--camera', '-c', type=int, default=0, help='Camera index (default: 0)')
+    parser.add_argument('--video', type=str, default=None, help='Path to a video file (optional)')
+    parser.add_argument('--max-hands', type=int, default=2, help='Maximum number of hands to detect')
+    parser.add_argument('--min-detect-confidence', type=float, default=0.5, help='Min detection confidence')
+    parser.add_argument('--model', type=str, default=None, help='Path to .task model for mediapipe tasks (optional)')
+    parser.add_argument('--test', action='store_true', help='Run headless test (no camera)')
+    args = parser.parse_args()
+
+    if args.test:
+        test_mode(max_num_hands=args.max_hands, min_detection_confidence=args.min_detect_confidence, model=args.model)
+    else:
+        main(
+            camera_index=args.camera,
+            video_path=args.video,
+            max_num_hands=args.max_hands,
+            min_detection_confidence=args.min_detect_confidence,
+            model=args.model,
+        )
