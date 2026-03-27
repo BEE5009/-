@@ -6,15 +6,62 @@ import os
 import sys
 from typing import Optional
 
+import pickle
+import numpy as np
+
 import cv2
 
 _SELECTED_THAI_FONT_PATH: Optional[str] = None
+
+MODEL_PATH = 'model.p'
+_gesture_model = None
+_gesture_label_map = None
+
+# ภาษา UI: 'TH' หรือ 'EN'
+UI_LANGUAGE = 'TH'
+
+UI_TEXT = {
+    'TH': {
+        'help': 'กด A เพื่อสลับภาษา TH/EN | Q=ออก | B=เซฟท่า | C=ล้างท่า | R=บันทึก | E=ลบ | T=จบ',
+        'lang_name': 'ไทย',
+        'saved': "บันทึกท่า 'ลับ' เรียบร้อยแล้ว",
+        'saved_fail': 'ไม่สามารถบันทึกท่าได้',
+        'no_hand': 'ยังไม่พบมือ (วางมือไว้ในกล้องก่อนบันทึก)',
+        'reset_template': "ล้างท่า 'ลับ' เรียบร้อยแล้ว",
+        'recorded': 'บันทึก',
+        'removed': 'ลบ',
+        'result': 'ผลลัพธ์',
+        'template_status': 'ท่า คงที่',
+    },
+    'EN': {
+        'help': 'Press A to toggle language TH/EN | Q=quit | B=save template | C=clear | R=record | E=erase | T=finish',
+        'lang_name': 'English',
+        'saved': "Saved template",
+        'saved_fail': 'Failed to save template',
+        'no_hand': 'No hand detected (place hand in camera first)',
+        'reset_template': 'Template cleared',
+        'recorded': 'Recorded',
+        'removed': 'Removed',
+        'result': 'Result',
+        'template_status': 'Template status',
+    }
+}
 
 try:
     from PIL import Image, ImageDraw, ImageFont
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
+
+
+def get_ui_text(key):
+    return UI_TEXT.get(UI_LANGUAGE, UI_TEXT['TH']).get(key, '')
+
+
+def toggle_language():
+    global UI_LANGUAGE
+    UI_LANGUAGE = 'EN' if UI_LANGUAGE == 'TH' else 'TH'
+    print(f"[Lang] เปลี่ยนภาษาเป็น {UI_TEXT[UI_LANGUAGE]['lang_name']}")
 
 
 def _draw_unicode_text(img, text, position, font_size=32, color=(0, 255, 0)):
@@ -111,6 +158,67 @@ def _draw_unicode_text(img, text, position, font_size=32, color=(0, 255, 0)):
     draw.text(position, text, font=font, fill=rgb_color)
 
     img[:] = cv2.cvtColor(array(img_pil), cv2.COLOR_RGB2BGR)
+
+
+def init_gesture_model():
+    global _gesture_model, _gesture_label_map
+    if _gesture_model is not None:
+        return
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"[model] ไม่พบไฟล์โมเดล: {MODEL_PATH}. จะใช้การเดลเยติกพื้นฐานแทน")
+        return
+
+    try:
+        with open(MODEL_PATH, 'rb') as f:
+            data = pickle.load(f)
+            _gesture_model = data.get('model')
+            _gesture_label_map = data.get('labels_dict') or data.get('label_map')
+            if _gesture_label_map is None:
+                print('[model] warning: no label map found in model file')
+            else:
+                print(f"[model] โหลดโมเดลสำเร็จ: {MODEL_PATH} ({len(_gesture_label_map)} labels)")
+    except Exception as e:
+        print(f"[model] ไม่สามารถโหลดโมเดลได้: {e}")
+        _gesture_model = None
+        _gesture_label_map = None
+
+
+def hand_landmarks_to_vector(landmarks):
+    if landmarks is None or len(landmarks) != 21:
+        return None
+
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    min_x = min(xs)
+    min_y = min(ys)
+
+    vec = []
+    for lm in landmarks:
+        vec.append(lm.x - min_x)
+        vec.append(lm.y - min_y)
+
+    return np.array(vec, dtype=np.float32).reshape(1, -1)
+
+
+def classify_gesture_model(hand_landmarks):
+    if _gesture_model is None or _gesture_label_map is None:
+        return None
+
+    vec = hand_landmarks_to_vector(hand_landmarks)
+    if vec is None:
+        return None
+
+    try:
+        idx = _gesture_model.predict(vec)[0]
+        label = _gesture_label_map.get(idx, None)
+        if label is None:
+            # Assuming labels are numeric class names if mapping absent
+            label = chr(ord('A') + int(idx)) if isinstance(idx, (int, np.integer)) else str(idx)
+        return str(label)
+    except Exception as e:
+        print(f"[model] ไม่สามารถพยากรณ์ได้: {e}")
+        return None
 
 
 # Thai alphabet ก-ฮ (44 consonants)
@@ -370,7 +478,7 @@ def run_with_solutions(cap, max_num_hands: int, min_detection_confidence: float)
                         mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2),
                     )
                     last_landmarks = hand_landmarks.landmark
-                    gesture = classify_gesture(last_landmarks)
+                    gesture = classify_gesture_model(last_landmarks) or classify_gesture(last_landmarks)
                     if is_banmai_pose(last_landmarks):
                         current_word = "ทำเพื่อ"
                     else:
@@ -391,7 +499,10 @@ def run_with_solutions(cap, max_num_hands: int, min_detection_confidence: float)
 
             # Show whether the 'บ้านลับ' pose template is set
             template_status = "เซฟแล้ว" if _BANMAI_TEMPLATE else "ยังไม่เซฟ"
-            _draw_unicode_text(image, f"ท่า บ้านลับ: {template_status}", (10, 160), font_size=22, color=(255, 255, 0))
+            _draw_unicode_text(image, f"{get_ui_text('template_status')}: {template_status}", (10, 160), font_size=22, color=(255, 255, 0))
+
+            #UI Help text
+            _draw_unicode_text(image, get_ui_text('help'), (10, 200), font_size=18, color=(255, 255, 255))
 
             #FPS
             curr_time = time.time()
@@ -403,17 +514,19 @@ def run_with_solutions(cap, max_num_hands: int, min_detection_confidence: float)
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27:
                 break
+            elif key == ord('a'):
+                toggle_language()
             elif key == ord('b'):  # Save current pose as "บ้านลับ"
                 if last_landmarks:
                     if save_banmai_template(last_landmarks):
-                        print("บันทึกท่า 'บ้านลับ' เรียบร้อยแล้ว")
+                        print(get_ui_text('saved'))
                     else:
-                        print("ไม่สามารถบันทึกท่า 'บ้านลับ' ได้")
+                        print(get_ui_text('saved_fail'))
                 else:
-                    print("ยังไม่พบมือ (วางมือไว้ในกล้องก่อนบันทึก)")
+                    print(get_ui_text('no_hand'))
             elif key == ord('c'):  # Clear saved template
                 clear_banmai_template()
-                print("ล้างท่า 'บ้านลับ' เรียบร้อยแล้ว")
+                print(get_ui_text('reset_template'))
             elif key == ord('r'):  # Record current gesture
                 if current_word and current_word != '?':
                     recorded_letters.append(current_word)
@@ -487,7 +600,7 @@ def run_with_tasks(cap, model_path: str, max_num_hands: int, min_detection_confi
                         cv2.circle(image_out, (x, y), 3, (0, 255, 0), -1)
 
                     last_landmarks = hand_landmarks
-                    gesture = classify_gesture(hand_landmarks)
+                    gesture = classify_gesture_model(hand_landmarks) or classify_gesture(hand_landmarks)
                     if is_banmai_pose(hand_landmarks):
                         current_word = "บ้านลับ"
                     else:
@@ -517,7 +630,8 @@ def run_with_tasks(cap, model_path: str, max_num_hands: int, min_detection_confi
 
             # Show whether the 'ลับ' pose template is set
             template_status = "เซฟแล้ว" if _BANMAI_TEMPLATE else "ยังไม่เซฟ"
-            _draw_unicode_text(image_out, f"ท่า ลับ: {template_status}", (10, 160), font_size=22, color=(255, 255, 0))
+            _draw_unicode_text(image_out, f"{get_ui_text('template_status')}: {template_status}", (10, 160), font_size=22, color=(255, 255, 0))
+            _draw_unicode_text(image_out, get_ui_text('help'), (10, 200), font_size=18, color=(255, 255, 255))
 
             curr_time = time.time()
             fps = 1 / (curr_time - prev_time) if prev_time else 0.0
@@ -528,17 +642,19 @@ def run_with_tasks(cap, model_path: str, max_num_hands: int, min_detection_confi
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q') or key == 27:
                 break
+            elif key == ord('a'):
+                toggle_language()
             elif key == ord('b'):  # Save current pose as "ลับ"
                 if last_landmarks:
                     if save_banmai_template(last_landmarks):
-                        print("บันทึกท่า 'ลับ' เรียบร้อยแล้ว")
+                        print(get_ui_text('saved'))
                     else:
-                        print("ไม่สามารถบันทึกท่า 'ลับ' ได้")
+                        print(get_ui_text('saved_fail'))
                 else:
-                    print("ยังไม่พบมือ (วางมือไว้ในกล้องก่อนบันทึก)")
+                    print(get_ui_text('no_hand'))
             elif key == ord('c'):  # Clear saved template
                 clear_banmai_template()
-                print("ล้างท่า 'ลับ' เรียบร้อยแล้ว")
+                print(get_ui_text('reset_template'))
             elif key == ord('r'):  # Record current gesture
                 if current_word and current_word != '?':
                     recorded_letters.append(current_word)
@@ -719,6 +835,9 @@ def main(camera_index: int = 0, video_path: Optional[str] = None, max_num_hands:
 
     if not _PIL_AVAILABLE:
         print('คำเตือน: Pillow ยังไม่ติดตั้ง; ข้อความไทยอาจแสดงเป็น ???? (ติดตั้งด้วย pip install pillow)')
+
+    # Load A-Z trained model (model.p) if available
+    init_gesture_model()
 
     # If user explicitly provided --pic-dir, run image evaluation mode
     if pic_dir is not None:

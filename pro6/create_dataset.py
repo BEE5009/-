@@ -14,22 +14,39 @@ import cv2
 import numpy as np
 
 try:
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
     import mediapipe as mp
 except ImportError:
     raise SystemExit('Please install mediapipe: pip install mediapipe')
 
 DATA_DIR = './data'
 OUTPUT_PICKLE = 'data.pickle'
+MODEL_PATH = './hand_landmarker.task'
 
 if not os.path.exists(DATA_DIR):
     raise SystemExit(f'Data directory not found: {DATA_DIR}')
 
-hands = mp.solutions.hands.Hands(
-    static_image_mode=True,
-    max_num_hands=1,
-    min_detection_confidence=0.5,
+if not os.path.exists(MODEL_PATH):
+    raise SystemExit(f'Model file not found: {MODEL_PATH}. Please download hand_landmarker.task from MediaPipe.')
+
+# Initialize hand landmarker with the task file
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+VisionRunningMode = vision.RunningMode
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=MODEL_PATH),
+    running_mode=VisionRunningMode.IMAGE,
+    num_hands=1,
+    min_hand_detection_confidence=0.5,
+    min_hand_presence_confidence=0.5,
     min_tracking_confidence=0.5,
 )
+
+landmarker = HandLandmarker.create_from_options(options)
+
 
 all_vectors = []
 all_labels = []
@@ -50,13 +67,18 @@ for class_name in sorted(os.listdir(DATA_DIR)):
             continue
 
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        result = hands.process(image_rgb)
+        
+        # Convert numpy array to MediaPipe Image
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+        
+        # Detect hand landmarks
+        detection_result = landmarker.detect(mp_image)
 
-        if not result.multi_hand_landmarks:
+        if not detection_result.hand_landmarks:
             print(f'Warning: no hand landmarks in {file_path}')
             continue
 
-        landmarks = result.multi_hand_landmarks[0].landmark
+        landmarks = detection_result.hand_landmarks[0]
         x_coords = [lm.x for lm in landmarks]
         y_coords = [lm.y for lm in landmarks]
 
@@ -72,8 +94,6 @@ for class_name in sorted(os.listdir(DATA_DIR)):
 
         all_vectors.append(vector)
         all_labels.append(class_name)
-
-hands.close()
 
 if len(all_vectors) == 0:
     raise SystemExit('No valid data extracted. Check your images and hand detection settings.')
